@@ -1,5 +1,5 @@
 use std::io::{self, Cursor, Write, Read};
-use std::{collections::HashMap};
+use std::collections::{HashMap, BTreeMap};
 use crate::min_heap::{MinHeap,HeapErr};
 use std::fs::File;
 use std::path::Path;
@@ -58,8 +58,8 @@ impl HuffmanTree {
     }
 
 
-    pub fn generate_table(&self) -> HashMap<u8, (u32, usize)> {
-        let mut table = HashMap::new();
+    pub fn generate_table(&self) -> BTreeMap<u8, (u32, usize)> {
+        let mut table = BTreeMap::new();
         self.root.generate_table(&mut table, 0, 32);
         table
     }
@@ -137,6 +137,26 @@ impl HuffmanTree {
         Self::from_frequencies(frequencies)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Failed to build tree"))
     }
+
+    pub fn print_structure(&self) {
+        println!("Huffman Tree Structure:");
+        self.print_node(&self.root, 0, "root");
+    }
+
+    fn print_node(&self, node: &HuffNode, depth: usize, label: &str) {
+        let indent = "  ".repeat(depth);
+        match node {
+            HuffNode::Leaf { byte, weight } => {
+                println!("{}{}-> Leaf: '{}' ({}) [weight: {}]", 
+                        indent, label, *byte as char, byte, weight);
+            },
+            HuffNode::Internal { weight, left, right } => {
+                println!("{}{}-> Internal [weight: {}]", indent, label, weight);
+                self.print_node(left, depth + 1, "L");
+                self.print_node(right, depth + 1, "R");
+            }
+        }
+    }
 }
 
 impl std::default::Default for HuffmanTree {
@@ -200,11 +220,11 @@ impl HuffNode {
         }
     }
 
-    pub fn generate_table(&self, code_table: &mut HashMap<u8, (u32, usize)>, so_far: u32, shift: usize) {
+    pub fn generate_table(&self, code_table: &mut BTreeMap<u8, (u32, usize)>, so_far: u32, shift: usize) {
         let max_bit = 1_u32.reverse_bits();
         match self {
             HuffNode::Leaf { byte, .. } => {
-                code_table.entry(*byte).insert_entry((so_far >> shift, 32-shift));
+                code_table.insert(*byte, (so_far >> shift, 32-shift));
             },
             HuffNode::Internal { left, right, .. } => {
                 left.generate_table(code_table, so_far >> 1, shift-1);
@@ -218,7 +238,15 @@ impl HuffNode {
 
 impl PartialEq for HuffNode {
     fn eq(&self, other: &Self) -> bool { 
-        self.weight().eq(&other.weight())
+        match (self, other) {
+            (HuffNode::Leaf { byte: a, weight: w1 }, HuffNode::Leaf { byte: b, weight: w2 }) => {
+                w1 == w2 && a == b
+            },
+            (HuffNode::Internal { weight: w1, .. }, HuffNode::Internal { weight: w2, .. }) => {
+                w1 == w2
+            },
+            _ => false,
+        }
     }
 }
 
@@ -226,13 +254,36 @@ impl Eq for HuffNode {}
 
 impl PartialOrd for HuffNode {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        //self.weight.partial_cmp(&other.weight)
         Some(self.cmp(other))        
     }
 }
 
 impl Ord for HuffNode {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.weight().cmp(&other.weight()) 
+        // First compare by weight
+        match self.weight().cmp(&other.weight()) {
+            std::cmp::Ordering::Equal => {
+                // If weights are equal, use tie-breaking rules for deterministic ordering
+                match (self, other) {
+                    // Leaf nodes: compare by byte value
+                    (HuffNode::Leaf { byte: a, .. }, HuffNode::Leaf { byte: b, .. }) => {
+                        a.cmp(b)
+                    },
+                    // Leaf vs Internal: Leaf comes first (lower priority)
+                    (HuffNode::Leaf { .. }, HuffNode::Internal { .. }) => {
+                        std::cmp::Ordering::Less
+                    },
+                    (HuffNode::Internal { .. }, HuffNode::Leaf { .. }) => {
+                        std::cmp::Ordering::Greater
+                    },
+                    // Internal vs Internal: compare by some deterministic property
+                    // For now, just consider them equal if weights are equal
+                    (HuffNode::Internal { .. }, HuffNode::Internal { .. }) => {
+                        std::cmp::Ordering::Equal
+                    },
+                }
+            },
+            other => other,
+        }
     }
 }
