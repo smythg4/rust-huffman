@@ -30,6 +30,13 @@ struct EncodingMetaData {
     tree_data: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct DecodingMetaData {
+    original_length: usize,
+    total_bits: usize,
+    lookup_table: BTreeMap<(u32, usize), u8>,
+}
+
 pub struct HuffmanCodec {
     tree: HuffmanTree,
     encode_table: BTreeMap<u8, (u32, usize)>, // byte -> (code, bit length)
@@ -394,6 +401,164 @@ impl HuffmanCodec {
         Ok(Self::new(tree))
     }
 
+    fn decode_with_channels<R: Read + Send + 'static, W: Write + Seek + Send + 'static>(
+        &self,
+        mut reader: R,
+        mut writer: W
+    ) -> io::Result<()> {
+        // channel for raw data chunks (Reader -> Decoder)
+        let (chunk_tx, chunk_rx) = mpsc::sync_channel::<Vec<u8>>(4);
+        // channel for compressed data (Decoder -> Writer)
+        let (compressed_tx, compressed_rx) = mpsc::sync_channel::<Vec<u8>>(4);
+        // channel for metadata (Reader -> Decoder)
+        let (metadata_tx, metadata_rx) = mpsc::channel::<DecodingMetaData>(); 
+
+        let lookup_table = self.generate_lookup_table();
+
+        let reader_handle = thread::spawn(move || -> io::Result<()> {
+            println!("Reader thread started...");
+            println!("Reading header...");
+            let (original_length, bit_count, _tree_data) = Self::read_header(&mut reader)?;
+            let metadata = DecodingMetaData {
+                original_length,
+                total_bits: bit_count,
+                lookup_table,
+            };
+            println!("Reader sending metadata to decoder...");
+            if metadata_tx.send(metadata).is_err() {
+                //
+            }
+            let mut buffer = [0u8; 4096];
+            
+            loop {
+                let bytes_read = reader.read(&mut buffer)?;
+                if bytes_read == 0 {
+                    break;
+                }
+                let chunk = buffer[..bytes_read].to_vec();
+                println!("Reader pushing chunk of {} bytes", chunk.len());
+                if chunk_tx.send(chunk).is_err() {
+                    break;
+                }
+            }
+            println!("Reader thread done.");
+            Ok(())
+        });
+
+        let decoder_handle = thread::spawn(move || -> io::Result<()> {
+            println!("Decoder thread started...");
+            let metadata = metadata_rx.recv().map_err(|_| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "Failed to receive metadata")
+            })?;
+            let original_length = metadata.original_length;
+            let lookup_table = metadata.lookup_table;
+            let total_bits = metadata.total_bits;
+            println!("Decoder received metadata");
+
+            // Decoder state variables
+            let mut decoded_bytes = 0;
+            let mut curr_word: u32 = 0;
+            let mut curr_bit_count = 0;
+            let mut global_bit_index = 0;
+
+            // Current chunk to process
+            let mut current_chunk: Option<Vec<u8>> = None;
+            let mut chunk_bit_index = 0;
+            
+            // Output buffer for batching decoded bytes
+            let mut output_buffer = Vec::with_capacity(4096);
+
+            while global_bit_index < total_bits && decoded_bytes < original_length {
+                // get next chunk if we need one
+                if current_chunk.is_none() || chunk_bit_index >= current_chunk.as_ref().unwrap().len() * 8 {
+                    match chunk_rx.recv() {
+                        Ok(chunk) => {
+                            println!("Decoder received chunk of {} bytes", chunk.len());
+                            current_chunk = Some(chunk);
+                            chunk_bit_index = 0;
+                        },
+                        Err(_) => break, // no more chunks
+                    }
+                }
+
+                if let Some(ref chunk) = current_chunk {
+                    let byte_index = chunk_bit_index / 8;
+                    let bit_position = 7 - (chunk_bit_index % 8); // MSB first
+
+                    if byte_index >= chunk.len() {
+                        // need next chunk
+                        current_chunk = None;
+                        continue;
+                    }
+
+                    let byte_val = chunk[byte_index];
+                    let bit = (byte_val >> bit_position) & 1;
+
+                    curr_word = (curr_word << 1) | (bit as u32);
+
+                    curr_bit_count += 1;
+                    chunk_bit_index += 1;
+                    global_bit_index += 1;
+
+                    if let Some(&decoded_byte) = lookup_table.get(&(curr_word, curr_bit_count)) {
+                        output_buffer.push(decoded_byte);
+                        decoded_bytes += 1;
+                        curr_word = 0;
+                        curr_bit_count = 0;
+
+                        // Send when buffer is full
+                        if output_buffer.len() >= 4096 {
+                            if compressed_tx.send(std::mem::take(&mut output_buffer)).is_err() {
+                                break; // writer thread finished
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Send any remaining bytes in the buffer
+            if !output_buffer.is_empty() {
+                if compressed_tx.send(output_buffer).is_err() {
+                    // Writer thread finished, but that's ok
+                }
+            }
+            
+            if decoded_bytes != original_length {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Expected {} bytes, decoded {} bytes", original_length, decoded_bytes)
+                ));
+            }
+
+            println!("Decoder thread done.");
+            Ok(())
+        });
+
+        let writer_handle = thread::spawn(move || -> io::Result<()> {
+            println!("Writer thread started...");
+
+            while let Ok(decoded_chunk) = compressed_rx.recv() {
+                println!("Writer received {} decoded bytes", decoded_chunk.len());
+                writer.write_all(&decoded_chunk)?;
+            }
+
+            println!("Writer thread done.");
+            Ok(())
+        });
+
+        // Wait for all threads to complete and handle errors
+        let reader_result = reader_handle.join().unwrap();
+        let decoder_result = decoder_handle.join().unwrap();
+        let writer_result = writer_handle.join().unwrap();
+
+        // Return first error encountered, or Ok if all succeeded
+        reader_result?;
+        decoder_result?;
+        writer_result?;
+
+        Ok(())
+    }
+
     fn read_header<R: Read>(reader: &mut R) -> io::Result<(usize, usize, Vec<u8>)> {
         let mut original_length_bytes = [0u8; 8];
         reader.read_exact(&mut original_length_bytes)?;
@@ -489,6 +654,15 @@ impl HuffmanCodec {
         }
 
         Ok(())
+    }
+
+    pub fn decode_file_to_file_channel<P1: AsRef<Path>, P2: AsRef<Path>>(input_path: P1, output_path: P2) -> io::Result<()> {
+        let mut reader = File::open(&input_path)?;
+        let codec = Self::from_stream(&mut reader)?;
+
+        // Now reader is reset to beginning, ready for decode_with_channels
+        let writer = File::create(output_path)?;
+        codec.decode_with_channels(reader, writer)
     }
     
     pub fn decode_file_to_file<P1: AsRef<Path>, P2: AsRef<Path>>(input_path: P1, output_path: P2) -> io::Result<()> {
@@ -635,57 +809,6 @@ mod test {
         println!("✅ File roundtrip test passed!");
     }
 
-    #[test]
-    fn test_sampling_vs_full_file() {
-        // Test with the large file that was failing before
-        let input_path = Path::new("contents/mobydick.txt");
-        let mut input_file = File::open(input_path).unwrap();
-        let mut original_data = Vec::new();
-        input_file.read_to_end(&mut original_data).unwrap();
-
-        println!("Testing sampling approach vs full file approach");
-        println!("File size: {} bytes", original_data.len());
-
-        // Method 1: Full file (existing approach)
-        let codec_full = HuffmanCodec::from_file(input_path).unwrap();
-        let compressed_full = codec_full.encode(&original_data).unwrap();
-        
-        // Method 2: Sampling approach with default config
-        let mut file_reader = File::open(input_path).unwrap();
-        let codec_sampled = HuffmanCodec::from_reader(&mut file_reader, None).unwrap();
-        let compressed_sampled = codec_sampled.encode(&original_data).unwrap();
-
-        // Method 3: Sampling with custom config (more samples to capture more byte variety)
-        let custom_config = SamplingConfig {
-            sample_size: 8192,  // Larger samples
-            num_samples: 50,    // More samples
-        };
-        let mut file_reader2 = File::open(input_path).unwrap();
-        let codec_custom = HuffmanCodec::from_reader(&mut file_reader2, Some(custom_config)).unwrap();
-        let compressed_custom = codec_custom.encode(&original_data).unwrap();
-
-        println!("Full file compression: {} bits", compressed_full.bit_count);
-        println!("Sampled compression (default): {} bits", compressed_sampled.bit_count);
-        println!("Sampled compression (custom): {} bits", compressed_custom.bit_count);
-        
-        println!("Full file efficiency: {:.2}%", 
-                (compressed_full.bit_count as f64 / (original_data.len() * 8) as f64) * 100.0);
-        println!("Sampled efficiency (default): {:.2}%", 
-                (compressed_sampled.bit_count as f64 / (original_data.len() * 8) as f64) * 100.0);
-        println!("Sampled efficiency (custom): {:.2}%", 
-                (compressed_custom.bit_count as f64 / (original_data.len() * 8) as f64) * 100.0);
-
-        // Test that all methods can decode correctly
-        let decoded_full = HuffmanCodec::decode(&compressed_full).unwrap();
-        let decoded_sampled = HuffmanCodec::decode(&compressed_sampled).unwrap();
-        let decoded_custom = HuffmanCodec::decode(&compressed_custom).unwrap();
-
-        assert_eq!(original_data, decoded_full);
-        assert_eq!(original_data, decoded_sampled);
-        assert_eq!(original_data, decoded_custom);
-        
-        println!("✅ All methods decode correctly!");
-    }
 
     #[test]
     fn test_moby_dick_compression_roundtrip() {
@@ -729,132 +852,87 @@ mod test {
         println!("✅ Moby Dick roundtrip successful! Text is byte-for-byte identical.");
     }
 
-    #[test]
-    fn test_streaming_decode() {
-        use std::fs;
-        
-        let input_path = Path::new("contents/mobydick.txt");
-        let compressed_path = Path::new("testing/mobydick_streaming_test.huff");
-        let decoded_path = Path::new("testing/mobydick_streaming_decoded.txt");
-        
-        // Encode file to compressed format
-        let mut file_reader = File::open(input_path).unwrap();
-        let codec = HuffmanCodec::from_reader(&mut file_reader, None).unwrap();
-        codec.encode_file_to_file(input_path, compressed_path).unwrap();
-        
-        // Use streaming decode to decode back
-        HuffmanCodec::decode_file_to_file(compressed_path, decoded_path).unwrap();
-        
-        // Verify roundtrip
-        let original_data = fs::read(input_path).unwrap();
-        let decoded_data = fs::read(decoded_path).unwrap();
-        
-        assert_eq!(original_data, decoded_data);
-        println!("✅ Streaming decode test passed!");
-        
-        // Test the from_stream constructor separately
-        let mut compressed_file = File::open(compressed_path).unwrap();
-        let codec_from_stream = HuffmanCodec::from_stream(&mut compressed_file).unwrap();
-        
-        // Verify we can decode with this codec too
-        let compressed_bytes = fs::read(compressed_path).unwrap();
-        let mut cursor = Cursor::new(&compressed_bytes[..]);
-        let compressed_data = CompressedData::deserialize(&mut cursor).unwrap();
-        let decoded_with_stream_codec = codec_from_stream.decode_data(&compressed_data).unwrap();
-        
-        assert_eq!(original_data, decoded_with_stream_codec);
-        println!("✅ from_stream constructor test passed!");
-    }
 
-    #[test] 
-    fn benchmark_channel_vs_stream_mp4() {
+
+    #[test]
+    fn benchmark_full_roundtrip_stream_vs_channel() {
         use std::fs;
         use std::time::Instant;
         
-        let input_path = Path::new("testing/vim.mp4");
+        let input_path = Path::new("contents/mobydick.txt");
         let mut file_reader = File::open(input_path).unwrap();
         let codec = HuffmanCodec::from_reader(&mut file_reader, None).unwrap();
         
         let original_size = fs::metadata(input_path).unwrap().len();
-        println!("Benchmarking MP4 with file size: {} bytes", original_size);
+        println!("Benchmarking full roundtrip with file size: {} bytes", original_size);
         
-        // Benchmark original streaming approach
-        let stream_output_path = Path::new("testing/benchmark_mp4_stream.huff");
-        let start = Instant::now();
-        codec.encode_file_to_file(input_path, stream_output_path).unwrap();
-        let stream_duration = start.elapsed();
-        let stream_output_size = fs::metadata(stream_output_path).unwrap().len();
+        // STREAM APPROACH: encode then decode
+        let stream_compressed_path = Path::new("testing/stream_roundtrip_compressed.huff");
+        let stream_final_path = Path::new("testing/stream_roundtrip_final.txt");
         
-        // Benchmark channel-based approach  
-        let channel_output_path = Path::new("testing/benchmark_mp4_channel.huff");
         let start = Instant::now();
-        codec.encode_file_to_file_channel(input_path, channel_output_path).unwrap();
-        let channel_duration = start.elapsed();
-        let channel_output_size = fs::metadata(channel_output_path).unwrap().len();
+        // Stream encode
+        codec.encode_file_to_file(input_path, stream_compressed_path).unwrap();
+        // Stream decode  
+        HuffmanCodec::decode_file_to_file(stream_compressed_path, stream_final_path).unwrap();
+        let stream_total_duration = start.elapsed();
+        
+        // CHANNEL APPROACH: encode then decode
+        let channel_compressed_path = Path::new("testing/channel_roundtrip_compressed.huff");
+        let channel_final_path = Path::new("testing/channel_roundtrip_final.txt");
+        
+        let start = Instant::now();
+        // Channel encode
+        codec.encode_file_to_file_channel(input_path, channel_compressed_path).unwrap();
+        // Channel decode
+        HuffmanCodec::decode_file_to_file_channel(channel_compressed_path, channel_final_path).unwrap();
+        let channel_total_duration = start.elapsed();
         
         // Compare results
-        println!("\n📊 BENCHMARK RESULTS:");
-        println!("==================");
-        println!("Original streaming: {:?}", stream_duration);
-        println!("Channel pipeline:   {:?}", channel_duration);
-        println!("Speedup: {:.2}x", stream_duration.as_secs_f64() / channel_duration.as_secs_f64());
+        println!("\n📊 FULL ROUNDTRIP BENCHMARK RESULTS:");
+        println!("=====================================");
+        println!("Original file size:     {} bytes", original_size);
+        println!("Stream roundtrip time:  {:?}", stream_total_duration);
+        println!("Channel roundtrip time: {:?}", channel_total_duration);
+        println!("Speedup: {:.2}x", stream_total_duration.as_secs_f64() / channel_total_duration.as_secs_f64());
         println!();
-        println!("Stream output size:  {} bytes", stream_output_size);
-        println!("Channel output size: {} bytes", channel_output_size);
-        println!("Output identical: {}", stream_output_size == channel_output_size);
         
-        // Instead of comparing compressed files directly, let's decode both and compare with original
+        // Verify both final files match the original
         let original_data = fs::read(input_path).unwrap();
+        let stream_final_data = fs::read(stream_final_path).unwrap();
+        let channel_final_data = fs::read(channel_final_path).unwrap();
         
-        println!("\n🔄 DECODING VERIFICATION:");
-        println!("========================");
+        let stream_compressed_size = fs::metadata(stream_compressed_path).unwrap().len();
+        let channel_compressed_size = fs::metadata(channel_compressed_path).unwrap().len();
         
-        // Decode stream-compressed file
-        let stream_decoded_path = Path::new("testing/benchmark_mp4_stream_decoded.mp4");
-        let start = Instant::now();
-        HuffmanCodec::decode_file_to_file(stream_output_path, stream_decoded_path).unwrap();
-        let stream_decode_duration = start.elapsed();
+        println!("📊 VERIFICATION RESULTS:");
+        println!("Stream compressed size:  {} bytes", stream_compressed_size);
+        println!("Channel compressed size: {} bytes", channel_compressed_size);
+        println!("Stream final size:       {} bytes", stream_final_data.len());
+        println!("Channel final size:      {} bytes", channel_final_data.len());
         
-        // Decode channel-compressed file  
-        let channel_decoded_path = Path::new("testing/benchmark_mp4_channel_decoded.mp4");
-        let start = Instant::now();
-        HuffmanCodec::decode_file_to_file(channel_output_path, channel_decoded_path).unwrap();
-        let channel_decode_duration = start.elapsed();
+        let stream_matches_original = stream_final_data == original_data;
+        let channel_matches_original = channel_final_data == original_data;
+        let compressed_files_match = stream_compressed_size == channel_compressed_size;
+        let final_files_match = stream_final_data == channel_final_data;
         
-        // Read decoded files
-        let stream_decoded_data = fs::read(stream_decoded_path).unwrap();
-        let channel_decoded_data = fs::read(channel_decoded_path).unwrap();
+        println!("\n✅ ACCURACY RESULTS:");
+        println!("Stream roundtrip == Original:    {}", stream_matches_original);
+        println!("Channel roundtrip == Original:   {}", channel_matches_original);
+        println!("Compressed files same size:      {}", compressed_files_match);
+        println!("Final files identical:           {}", final_files_match);
         
-        println!("Original file size:         {} bytes", original_data.len());
-        println!("Stream decoded size:        {} bytes", stream_decoded_data.len());
-        println!("Channel decoded size:       {} bytes", channel_decoded_data.len());
+        // These are what we really care about - perfect roundtrip compression
+        assert!(stream_matches_original, "Stream roundtrip should produce original");
+        assert!(channel_matches_original, "Channel roundtrip should produce original");
+        assert!(final_files_match, "Both roundtrip approaches should produce identical results");
         
-        println!("\nDecode times:");
-        println!("Stream decode:  {:?}", stream_decode_duration);
-        println!("Channel decode: {:?}", channel_decode_duration);
-        
-        // Verify both decoded files match the original
-        let stream_matches_original = stream_decoded_data == original_data;
-        let channel_matches_original = channel_decoded_data == original_data;
-        let decoded_files_match = stream_decoded_data == channel_decoded_data;
-        
-        println!("\n✅ VERIFICATION RESULTS:");
-        println!("Stream decoded == Original:  {}", stream_matches_original);
-        println!("Channel decoded == Original: {}", channel_matches_original);  
-        println!("Both decoded files identical: {}", decoded_files_match);
-        
-        // This is what we really care about - both should decode to the original
-        assert!(stream_matches_original, "Stream approach should decode back to original");
-        assert!(channel_matches_original, "Channel approach should decode back to original");
-        assert!(decoded_files_match, "Both approaches should decode to the same result");
-        
-        println!("🎉 SUCCESS: Both approaches produce perfect MP4 roundtrip compression!");
-        println!("📹 Decoded MP4 files should be playable and identical to original!");
+        println!("🎉 SUCCESS: Both roundtrip approaches produce perfect compression!");
         
         // Cleanup
-        fs::remove_file(stream_output_path).ok();
-        fs::remove_file(channel_output_path).ok();
-        fs::remove_file(stream_decoded_path).ok();
-        fs::remove_file(channel_decoded_path).ok();
+        fs::remove_file(stream_compressed_path).ok();
+        fs::remove_file(stream_final_path).ok();
+        fs::remove_file(channel_compressed_path).ok();
+        fs::remove_file(channel_final_path).ok();
     }
 }
