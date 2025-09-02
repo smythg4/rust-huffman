@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, SeekFrom, Write, Cursor};
 use std::path::Path;
 use std::fs::File;
+use std::sync::mpsc;
+use std::thread;
 
 use crate::hufftree::HuffmanTree;
 use crate::bit_vec::BitVec;
@@ -19,6 +21,13 @@ impl Default for SamplingConfig {
             num_samples: 15
         }
     }
+}
+
+#[derive(Debug)]
+struct EncodingMetaData {
+    original_length: usize,
+    total_bits: usize,
+    tree_data: Vec<u8>,
 }
 
 pub struct HuffmanCodec {
@@ -83,6 +92,158 @@ impl HuffmanCodec {
         })?;
 
         Ok(Self::new(tree))
+    }
+
+    fn encode_with_channels<R: Read + Send + 'static, W: Write + Seek + Send + 'static>(
+        &self,
+        mut reader: R,
+        mut writer: W
+    ) -> io::Result<()> {
+        // channel for raw data chunks (Reader -> Encoder)
+        let (chunk_tx, chunk_rx) = mpsc::sync_channel::<Vec<u8>>(4);
+        // channel for compressed data (Encoder -> Writer)
+        let (compressed_tx, compressed_rx) = mpsc::sync_channel::<Vec<u8>>(4);
+        // channel for metadata (Encoder -> Writer)
+        let (metadata_tx, metadata_rx) = mpsc::channel::<EncodingMetaData>(); 
+
+        let encode_table = self.encode_table.clone();
+        let tree_data = self.tree.serialize()?;
+
+        // reader thread
+        let reader_handle = thread::spawn(move || -> io::Result<()> {
+            let mut buffer = [0u8; 4096];
+            println!("Reader thread started...");
+            loop {
+                let bytes_read = reader.read(&mut buffer)?;
+                if bytes_read == 0 {
+                    break;
+                }
+
+                let chunk = buffer[..bytes_read].to_vec();
+                println!("Reader pushing chunk of {} bytes", chunk.len());
+                if chunk_tx.send(chunk).is_err() {
+                    break;
+                }
+            }
+            println!("Reader thread done.");
+            Ok(())
+        });
+
+        // encoder thread
+        let encoder_handle = thread::spawn(move || -> io::Result<()> {
+            let mut bit_vec = BitVec::new();
+            let mut total_bits = 0;
+            let mut original_length = 0;
+            println!("Encoder thread started...");
+            while let Ok(chunk) = chunk_rx.recv() {
+                println!("Encoder received chunk of {} bytes", chunk.len());
+                original_length += chunk.len();
+
+                for &byte in &chunk {
+                    if let Some((code, bit_length)) = encode_table.get(&byte) {
+                        total_bits += bit_length;
+                        bit_vec.push_bits(*code, *bit_length);
+                    } else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Byte{} not in encode table", byte)
+                        ));
+                    }
+                }
+
+                if bit_vec.as_bytes().len() > 2048 {
+                    let complete_bytes = bit_vec.bit_count() / 8;
+                    if complete_bytes > 0 {
+                        let data_to_send = bit_vec.as_bytes()[..complete_bytes].to_vec();
+                        println!("Encoder pushing chunk of {} bytes", data_to_send.len());
+                        if compressed_tx.send(data_to_send).is_err() {
+                            break;
+                        }
+                    }
+
+                    let remaining_bits = bit_vec.bit_count() % 8;
+                    if remaining_bits > 0 {
+                        let last_byte = bit_vec.as_bytes()[complete_bytes];
+                        let mut new_bit_vec = BitVec::new();
+                        for bit_pos in 0..remaining_bits {
+                            let bit = (last_byte >> (7 - bit_pos)) & 1 != 0;
+                            new_bit_vec.push_bits(if bit { 1 } else { 0 }, 1);
+                        }
+                        bit_vec = new_bit_vec;
+                    } else {
+                        bit_vec = BitVec::new();
+                    }
+                }
+            }
+
+            let metadata = EncodingMetaData {
+                original_length,
+                total_bits,
+                tree_data
+            };
+
+            println!("Encoder pushing metadata: {:?}", metadata);
+            let _ = metadata_tx.send(metadata);
+
+            // find dangling bits
+            if bit_vec.bit_count() > 0 {
+                let final_data = bit_vec.as_bytes().to_vec();
+                println!("Encoder pushing final chunk of {} bytes", final_data.len());
+                let _ = compressed_tx.send(final_data);
+            }
+
+            println!("Encoder thread done.");
+            Ok(())
+        });
+
+        // writer thread
+        let writer_handle = thread::spawn(move || -> io::Result<()> {
+            use std::fs;
+            use std::io::copy;
+            
+            println!("Writer thread started...");
+
+            let temp_path = std::env::temp_dir().join("huffman_temp_compressed.dat");
+            let mut temp_file = File::create(&temp_path)?;
+
+            let mut compressed_bytes_written = 0;
+            while let Ok(data) = compressed_rx.recv() {
+                temp_file.write_all(&data)?;
+                compressed_bytes_written += data.len();
+            }
+            temp_file.flush()?;
+
+            let metadata = metadata_rx.recv().map_err(|_| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "Failed to receive metadata")
+            })?;
+
+            writer.write_all(&(metadata.original_length as u64).to_le_bytes())?;
+            writer.write_all(&(metadata.total_bits as u64).to_le_bytes())?;
+            writer.write_all(&(metadata.tree_data.len() as u64).to_le_bytes())?;
+            writer.write_all(&metadata.tree_data)?;
+            writer.write_all(&(compressed_bytes_written as u64).to_le_bytes())?;
+
+            let mut temp_file = File::open(&temp_path)?;
+            copy(&mut temp_file, &mut writer)?;
+
+            fs::remove_file(&temp_path)?;
+
+            println!("Writer thread done.");
+
+            Ok(())
+        });
+
+        // Wait for all threads to complete and handle errors
+        let reader_result = reader_handle.join().unwrap();
+        let encoder_result = encoder_handle.join().unwrap();
+        let writer_result = writer_handle.join().unwrap();
+
+        // Return first error encountered, or Ok if all succeeded
+        reader_result?;
+        encoder_result?;
+        writer_result?;
+
+        Ok(())
     }
 
     fn encode_stream<R: Read, W: Write + Seek>(&self, mut reader: R, mut writer: W) -> io::Result<()> {
@@ -209,6 +370,12 @@ impl HuffmanCodec {
         let reader = File::open(input_path)?;
         let writer = File::create(output_path)?;
         self.encode_stream(reader, writer)
+    }
+
+    pub fn encode_file_to_file_channel<P1: AsRef<Path>, P2: AsRef<Path>>(&self, input_path: P1, output_path: P2) -> io::Result<()> {
+        let reader = File::open(input_path)?;
+        let writer = File::create(output_path)?;
+        self.encode_with_channels(reader, writer)
     }
 
     pub fn from_compressed(compressed: &CompressedData) -> io::Result<Self> {
@@ -531,7 +698,7 @@ mod test {
         println!("Built codec from mobydick.txt samples");
 
         let compressed_path = Path::new("testing/mobydick_compressed.huff");
-        codec.encode_file_to_file(input_path, compressed_path).unwrap();
+        codec.encode_file_to_file_channel(input_path, compressed_path).unwrap();
         
         let original_size = fs::metadata(input_path).unwrap().len();
         let compressed_size = fs::metadata(compressed_path).unwrap().len();
@@ -597,5 +764,97 @@ mod test {
         
         assert_eq!(original_data, decoded_with_stream_codec);
         println!("✅ from_stream constructor test passed!");
+    }
+
+    #[test] 
+    fn benchmark_channel_vs_stream_mp4() {
+        use std::fs;
+        use std::time::Instant;
+        
+        let input_path = Path::new("testing/vim.mp4");
+        let mut file_reader = File::open(input_path).unwrap();
+        let codec = HuffmanCodec::from_reader(&mut file_reader, None).unwrap();
+        
+        let original_size = fs::metadata(input_path).unwrap().len();
+        println!("Benchmarking MP4 with file size: {} bytes", original_size);
+        
+        // Benchmark original streaming approach
+        let stream_output_path = Path::new("testing/benchmark_mp4_stream.huff");
+        let start = Instant::now();
+        codec.encode_file_to_file(input_path, stream_output_path).unwrap();
+        let stream_duration = start.elapsed();
+        let stream_output_size = fs::metadata(stream_output_path).unwrap().len();
+        
+        // Benchmark channel-based approach  
+        let channel_output_path = Path::new("testing/benchmark_mp4_channel.huff");
+        let start = Instant::now();
+        codec.encode_file_to_file_channel(input_path, channel_output_path).unwrap();
+        let channel_duration = start.elapsed();
+        let channel_output_size = fs::metadata(channel_output_path).unwrap().len();
+        
+        // Compare results
+        println!("\n📊 BENCHMARK RESULTS:");
+        println!("==================");
+        println!("Original streaming: {:?}", stream_duration);
+        println!("Channel pipeline:   {:?}", channel_duration);
+        println!("Speedup: {:.2}x", stream_duration.as_secs_f64() / channel_duration.as_secs_f64());
+        println!();
+        println!("Stream output size:  {} bytes", stream_output_size);
+        println!("Channel output size: {} bytes", channel_output_size);
+        println!("Output identical: {}", stream_output_size == channel_output_size);
+        
+        // Instead of comparing compressed files directly, let's decode both and compare with original
+        let original_data = fs::read(input_path).unwrap();
+        
+        println!("\n🔄 DECODING VERIFICATION:");
+        println!("========================");
+        
+        // Decode stream-compressed file
+        let stream_decoded_path = Path::new("testing/benchmark_mp4_stream_decoded.mp4");
+        let start = Instant::now();
+        HuffmanCodec::decode_file_to_file(stream_output_path, stream_decoded_path).unwrap();
+        let stream_decode_duration = start.elapsed();
+        
+        // Decode channel-compressed file  
+        let channel_decoded_path = Path::new("testing/benchmark_mp4_channel_decoded.mp4");
+        let start = Instant::now();
+        HuffmanCodec::decode_file_to_file(channel_output_path, channel_decoded_path).unwrap();
+        let channel_decode_duration = start.elapsed();
+        
+        // Read decoded files
+        let stream_decoded_data = fs::read(stream_decoded_path).unwrap();
+        let channel_decoded_data = fs::read(channel_decoded_path).unwrap();
+        
+        println!("Original file size:         {} bytes", original_data.len());
+        println!("Stream decoded size:        {} bytes", stream_decoded_data.len());
+        println!("Channel decoded size:       {} bytes", channel_decoded_data.len());
+        
+        println!("\nDecode times:");
+        println!("Stream decode:  {:?}", stream_decode_duration);
+        println!("Channel decode: {:?}", channel_decode_duration);
+        
+        // Verify both decoded files match the original
+        let stream_matches_original = stream_decoded_data == original_data;
+        let channel_matches_original = channel_decoded_data == original_data;
+        let decoded_files_match = stream_decoded_data == channel_decoded_data;
+        
+        println!("\n✅ VERIFICATION RESULTS:");
+        println!("Stream decoded == Original:  {}", stream_matches_original);
+        println!("Channel decoded == Original: {}", channel_matches_original);  
+        println!("Both decoded files identical: {}", decoded_files_match);
+        
+        // This is what we really care about - both should decode to the original
+        assert!(stream_matches_original, "Stream approach should decode back to original");
+        assert!(channel_matches_original, "Channel approach should decode back to original");
+        assert!(decoded_files_match, "Both approaches should decode to the same result");
+        
+        println!("🎉 SUCCESS: Both approaches produce perfect MP4 roundtrip compression!");
+        println!("📹 Decoded MP4 files should be playable and identical to original!");
+        
+        // Cleanup
+        fs::remove_file(stream_output_path).ok();
+        fs::remove_file(channel_output_path).ok();
+        fs::remove_file(stream_decoded_path).ok();
+        fs::remove_file(channel_decoded_path).ok();
     }
 }
