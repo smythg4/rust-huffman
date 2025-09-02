@@ -1,3 +1,4 @@
+#[derive(Default)]
 pub struct BitVec {
     bits: Vec<u8>,
     bit_count: usize,

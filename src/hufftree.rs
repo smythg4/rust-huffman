@@ -78,18 +78,18 @@ impl HuffmanTree {
 
     fn extract_frequencies(&self) -> HashMap<u8, usize> {
         let mut frequencies = HashMap::new();
-        self.extract_node_frequencies(&self.root, &mut frequencies);
+        Self::extract_node_frequencies(&self.root, &mut frequencies);
         frequencies
     }
 
-    fn extract_node_frequencies(&self, node: &HuffNode, frequencies: &mut HashMap<u8, usize>) {
+    fn extract_node_frequencies(node: &HuffNode, frequencies: &mut HashMap<u8, usize>) {
         match node {
             HuffNode::Leaf { byte, weight } => {
                 frequencies.insert(*byte, *weight);
             },
             HuffNode::Internal { left, right, .. } => {
-                self.extract_node_frequencies(left, frequencies);
-                self.extract_node_frequencies(right, frequencies);
+                Self::extract_node_frequencies(left, frequencies);
+                Self::extract_node_frequencies(right, frequencies);
             }
         }
     }
@@ -140,10 +140,10 @@ impl HuffmanTree {
 
     pub fn print_structure(&self) {
         println!("Huffman Tree Structure:");
-        self.print_node(&self.root, 0, "root");
+        Self::print_node(&self.root, 0, "root");
     }
 
-    fn print_node(&self, node: &HuffNode, depth: usize, label: &str) {
+    fn print_node(node: &HuffNode, depth: usize, label: &str) {
         let indent = "  ".repeat(depth);
         match node {
             HuffNode::Leaf { byte, weight } => {
@@ -152,8 +152,8 @@ impl HuffmanTree {
             },
             HuffNode::Internal { weight, left, right } => {
                 println!("{}{}-> Internal [weight: {}]", indent, label, weight);
-                self.print_node(left, depth + 1, "L");
-                self.print_node(right, depth + 1, "R");
+                Self::print_node(left, depth + 1, "L");
+                Self::print_node(right, depth + 1, "R");
             }
         }
     }
