@@ -60,7 +60,7 @@ impl HuffmanTree {
 
     pub fn generate_table(&self) -> BTreeMap<u8, (u32, usize)> {
         let mut table = BTreeMap::new();
-        self.root.generate_table(&mut table, 0, 32);
+        self.root.generate_table(&mut table, 0, 0);
         table
     }
 
@@ -220,15 +220,15 @@ impl HuffNode {
         }
     }
 
-    pub fn generate_table(&self, code_table: &mut BTreeMap<u8, (u32, usize)>, so_far: u32, shift: usize) {
-        let max_bit = 1_u32.reverse_bits();
+    pub fn generate_table(&self, code_table: &mut BTreeMap<u8, (u32, usize)>, code: u32, depth: usize) {
         match self {
             HuffNode::Leaf { byte, .. } => {
-                code_table.insert(*byte, (so_far >> shift, 32-shift));
+                code_table.insert(*byte, (code, depth));
             },
             HuffNode::Internal { left, right, .. } => {
-                left.generate_table(code_table, so_far >> 1, shift-1);
-                right.generate_table(code_table, (so_far >> 1) + max_bit, shift-1);
+                // Left = 0, Right = 1, building codes from MSB to LSB
+                left.generate_table(code_table, code << 1, depth + 1);
+                right.generate_table(code_table, (code << 1) | 1, depth + 1);
             }
         }
     }

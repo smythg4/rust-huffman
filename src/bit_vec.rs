@@ -51,24 +51,37 @@ impl BitVec {
     }
 
     pub fn read_bits(&self, start: usize, count: usize) -> u32 {
-        let mut result = 0;
-
-        for i in 0..count {
-            let bit_index = start + i;
-            let byte_index = bit_index / 8;
-            let bit_offset = bit_index % 8;
-
-            if byte_index >= self.bits.len() {
-                // don't try to read past the end
-                break;
+        let mut result = 0u32;
+        let mut bits_read = 0;
+        
+        let end_bit = start + count - 1;
+        let start_byte = start / 8;
+        let end_byte = end_bit / 8;
+        
+        for byte_idx in start_byte..=end_byte {
+            if byte_idx >= self.bits.len() {
+                continue;
             }
-
-            // extract the bit
-            let bit = (self.bits[byte_index] >> (7 - bit_offset)) & 1;
-
-            result = (result << 1) | (bit as u32);
+            
+            let byte_val = self.bits[byte_idx];
+            
+            for shift in (0..8).rev() {
+                let global_bit_index = byte_idx * 8 + (7 - shift);
+                
+                if global_bit_index < start || global_bit_index > end_bit {
+                    continue;
+                }
+                
+                if bits_read >= count {
+                    break;
+                }
+                
+                let bit = (byte_val >> shift) & 1;
+                result = (result << 1) | (bit as u32);
+                bits_read += 1;
+            }
         }
-
+        
         result
     }
 }
