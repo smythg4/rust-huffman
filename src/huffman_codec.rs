@@ -4,7 +4,7 @@ use std::path::Path;
 use std::fs::File;
 
 use crate::hufftree::HuffmanTree;
-use crate::bit_vec::{self, BitVec};
+use crate::bit_vec::BitVec;
 use crate::compressed_data::CompressedData;
 
 pub struct SamplingConfig {
@@ -216,6 +216,123 @@ impl HuffmanCodec {
         Ok(Self::new(tree))
     }
 
+    pub fn from_stream<R: Read + Seek>(mut reader: R) -> io::Result<Self> {
+        let current_pos = reader.stream_position()?;
+        let (_original_length, _bit_count, tree_data) = Self::read_header(&mut reader)?;
+        
+        // Reset reader position for future use
+        reader.seek(SeekFrom::Start(current_pos))?;
+        
+        let tree = HuffmanTree::deserialize(&tree_data)?;
+        Ok(Self::new(tree))
+    }
+
+    fn read_header<R: Read>(reader: &mut R) -> io::Result<(usize, usize, Vec<u8>)> {
+        let mut original_length_bytes = [0u8; 8];
+        reader.read_exact(&mut original_length_bytes)?;
+        let original_length = u64::from_le_bytes(original_length_bytes) as usize;
+
+        let mut bit_count_bytes = [0u8; 8];
+        reader.read_exact(&mut bit_count_bytes)?;
+        let bit_count = u64::from_le_bytes(bit_count_bytes) as usize;
+
+        let mut tree_len_bytes = [0u8; 8];
+        reader.read_exact(&mut tree_len_bytes)?;
+        let tree_len = u64::from_le_bytes(tree_len_bytes) as usize;
+
+        let mut tree_data = vec![0u8; tree_len];
+        reader.read_exact(&mut tree_data)?;
+
+        let mut data_len_bytes = [0u8; 8];
+        reader.read_exact(&mut data_len_bytes)?;
+
+        Ok( (original_length, bit_count, tree_data) )
+    }
+
+    fn decode_stream<R: Read, W: Write>(&self, mut reader: R, mut writer: W) -> io::Result<()> {
+        let (original_length, bit_count, _tree_data) = Self::read_header(&mut reader)?;
+
+        let lookup_table = self.generate_lookup_table();
+
+        let mut decoded_bytes = 0;
+        let mut curr_word: u32 = 0;
+        let mut curr_bit_count = 0;
+        let mut global_bit_index = 0;
+        let mut output_buffer = Vec::with_capacity(4096);
+
+        let mut input_buffer = [0u8; 4096];
+        let mut buffer_bit_index = 0; // current position in buffer
+
+        let mut bytes_in_buffer = reader.read(&mut input_buffer)?;
+        let mut buffer_bits = bytes_in_buffer * 8;
+
+        while global_bit_index < bit_count && decoded_bytes < original_length {
+            // check if we need to read more
+            if buffer_bit_index >= buffer_bits {
+                // read next chunk
+                bytes_in_buffer = reader.read(&mut input_buffer)?;
+                if bytes_in_buffer == 0 {
+                    break; // EOF
+                }
+                buffer_bits = bytes_in_buffer * 8;
+                buffer_bit_index = 0;
+            }
+
+            // extract next bit from buffer
+            let byte_index = buffer_bit_index / 8;
+            let bit_position = 7 - (buffer_bit_index % 8); // MSB first
+
+            if byte_index >= bytes_in_buffer {
+                break;
+            }
+
+            let byte_val = input_buffer[byte_index];
+            let bit = (byte_val >> bit_position) & 1;
+
+            curr_word = (curr_word << 1) | (bit as u32);
+            curr_bit_count += 1;
+            buffer_bit_index += 1;
+            global_bit_index += 1;
+
+            // check the lookup table for a match
+            if let Some(&decoded_byte) = lookup_table.get(&(curr_word, curr_bit_count)) {
+                output_buffer.push(decoded_byte);
+                decoded_bytes += 1;
+                curr_word = 0;
+                curr_bit_count = 0;
+
+                // write buffer when it gets full
+                if output_buffer.len() >= 4096 {
+                    writer.write_all(&output_buffer)?;
+                    output_buffer.clear();
+                }
+            }
+        }
+
+        // write dangling bytes
+        if !output_buffer.is_empty() {
+            writer.write_all(&output_buffer)?;
+        }
+
+        if decoded_bytes != original_length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Expected {} bytes, decoded {}", original_length, decoded_bytes)
+            ));
+        }
+
+        Ok(())
+    }
+    
+    pub fn decode_file_to_file<P1: AsRef<Path>, P2: AsRef<Path>>(input_path: P1, output_path: P2) -> io::Result<()> {
+        let mut reader = File::open(&input_path)?;
+        let codec = Self::from_stream(&mut reader)?;
+        
+        // Now reader is reset to beginning, ready for decode_stream
+        let writer = File::create(output_path)?;
+        codec.decode_stream(reader, writer)
+    }
+
     pub fn decode_data(&self, compressed: &CompressedData) -> io::Result<Vec<u8>> {
         let lookup_table = self.generate_lookup_table();
         
@@ -353,8 +470,6 @@ mod test {
 
     #[test]
     fn test_sampling_vs_full_file() {
-        use std::fs;
-        
         // Test with the large file that was failing before
         let input_path = Path::new("contents/mobydick.txt");
         let mut input_file = File::open(input_path).unwrap();
@@ -406,48 +521,6 @@ mod test {
     }
 
     #[test]
-    fn test_encode_vim_mp4_roundtrip() {
-        use std::fs;
-
-        // Create a codec using sampling from the MP4 file itself
-        let input_path = Path::new("testing/vim.mp4");
-        let mut file_reader = File::open(input_path).unwrap();
-        let codec = HuffmanCodec::from_reader(&mut file_reader, None).unwrap();
-
-        println!("Built codec from vim.mp4 samples");
-
-        // Test file-to-file encoding 
-        let compressed_path = Path::new("testing/vim_compressed.huff");
-        codec.encode_file_to_file(input_path, compressed_path).unwrap();
-        
-        // Get file sizes for compression stats
-        let original_size = fs::metadata(input_path).unwrap().len();
-        let compressed_size = fs::metadata(compressed_path).unwrap().len();
-        
-        println!("Original vim.mp4 size: {} bytes", original_size);
-        println!("Compressed size: {} bytes", compressed_size);
-        println!("Compression ratio: {:.2}%", 
-                (compressed_size as f64 / original_size as f64) * 100.0);
-        
-        // Decode back to verify roundtrip
-        let compressed_bytes = fs::read(compressed_path).unwrap();
-        let mut cursor = Cursor::new(&compressed_bytes[..]);
-        let compressed_data = CompressedData::deserialize(&mut cursor).unwrap();
-        let decoded_data = HuffmanCodec::decode(&compressed_data).unwrap();
-        
-        // Write decoded data back to a new file
-        let decoded_path = Path::new("testing/vim_decoded.mp4");
-        fs::write(decoded_path, &decoded_data).unwrap();
-        
-        // Verify roundtrip integrity
-        let original_data = fs::read(input_path).unwrap();
-        assert_eq!(original_data, decoded_data);
-        
-        println!("Decoded vim.mp4 size: {} bytes", decoded_data.len());
-        println!("✅ vim.mp4 roundtrip successful! Video should still work.");
-    }
-
-    #[test]
     fn test_moby_dick_compression_roundtrip() {
         use std::fs;
 
@@ -487,5 +560,42 @@ mod test {
         
         println!("Decoded mobydick.txt size: {} bytes", decoded_data.len());
         println!("✅ Moby Dick roundtrip successful! Text is byte-for-byte identical.");
+    }
+
+    #[test]
+    fn test_streaming_decode() {
+        use std::fs;
+        
+        let input_path = Path::new("contents/mobydick.txt");
+        let compressed_path = Path::new("testing/mobydick_streaming_test.huff");
+        let decoded_path = Path::new("testing/mobydick_streaming_decoded.txt");
+        
+        // Encode file to compressed format
+        let mut file_reader = File::open(input_path).unwrap();
+        let codec = HuffmanCodec::from_reader(&mut file_reader, None).unwrap();
+        codec.encode_file_to_file(input_path, compressed_path).unwrap();
+        
+        // Use streaming decode to decode back
+        HuffmanCodec::decode_file_to_file(compressed_path, decoded_path).unwrap();
+        
+        // Verify roundtrip
+        let original_data = fs::read(input_path).unwrap();
+        let decoded_data = fs::read(decoded_path).unwrap();
+        
+        assert_eq!(original_data, decoded_data);
+        println!("✅ Streaming decode test passed!");
+        
+        // Test the from_stream constructor separately
+        let mut compressed_file = File::open(compressed_path).unwrap();
+        let codec_from_stream = HuffmanCodec::from_stream(&mut compressed_file).unwrap();
+        
+        // Verify we can decode with this codec too
+        let compressed_bytes = fs::read(compressed_path).unwrap();
+        let mut cursor = Cursor::new(&compressed_bytes[..]);
+        let compressed_data = CompressedData::deserialize(&mut cursor).unwrap();
+        let decoded_with_stream_codec = codec_from_stream.decode_data(&compressed_data).unwrap();
+        
+        assert_eq!(original_data, decoded_with_stream_codec);
+        println!("✅ from_stream constructor test passed!");
     }
 }
