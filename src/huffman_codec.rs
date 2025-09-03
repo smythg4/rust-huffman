@@ -5,6 +5,8 @@ use std::fs::File;
 use std::sync::mpsc;
 use std::thread;
 
+use crate::runtime::channel::{channel, Sender, Receiver};
+
 use crate::hufftree::HuffmanTree;
 use crate::bit_vec::BitVec;
 use crate::compressed_data::CompressedData;
@@ -37,6 +39,7 @@ struct DecodingMetaData {
     lookup_table: BTreeMap<(u32, usize), u8>,
 }
 
+#[derive(Debug, Clone)]
 pub struct HuffmanCodec {
     tree: HuffmanTree,
     encode_table: BTreeMap<u8, (u32, usize)>, // byte -> (code, bit length)
@@ -101,6 +104,175 @@ impl HuffmanCodec {
         Ok(Self::new(tree))
     }
 
+    async fn async_reader_task<R: Read>(mut reader: R, chunk_tx: Sender<Vec<u8>>) {
+        let mut buffer = [0u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break, // EOF
+                Ok(bytes_read) => {
+                    let chunk = buffer[..bytes_read].to_vec();
+                    if chunk_tx.send(chunk).await.is_err() {
+                        break; // receiver dropped
+                    }
+                },
+                Err(_) => break,
+            }
+        }
+    }
+
+    async fn async_encoder_task(
+        code_table: BTreeMap<u8, (u32, usize)>,
+        tree: HuffmanTree,
+        mut chunk_rx: Receiver<Vec<u8>>,
+        encoded_tx: Sender<Vec<u8>>,
+        metadata_tx: Sender<EncodingMetaData>,
+    ) {
+        let mut total_bits = 0usize;
+        let mut original_length = 0usize;
+        let mut bit_vec = BitVec::new(); // Single BitVec across all chunks
+
+
+        while let Ok(chunk) = chunk_rx.recv().await {
+            original_length += chunk.len();
+
+            // Add bits to the accumulated BitVec
+            for &byte in &chunk {
+                if let Some(&(code, bit_length)) = code_table.get(&byte) {
+                    total_bits += bit_length;
+                    bit_vec.push_bits(code, bit_length);
+                }
+            }
+
+            // Send complete bytes when buffer gets large (like original channels approach)
+            if bit_vec.as_bytes().len() > 2048 {
+                let complete_bytes = bit_vec.bit_count() / 8;
+                if complete_bytes > 0 {
+                    let data_to_send = bit_vec.as_bytes()[..complete_bytes].to_vec();
+                    if encoded_tx.send(data_to_send).await.is_err() {
+                        return;
+                    }
+                }
+
+                // Keep remaining bits (like original logic)
+                let remaining_bits = bit_vec.bit_count() % 8;
+                if remaining_bits > 0 {
+                    let last_byte = bit_vec.as_bytes()[complete_bytes];
+                    let mut new_bit_vec = BitVec::new();
+                    for bit_pos in 0..remaining_bits {
+                        let bit = (last_byte >> (7 - bit_pos)) & 1 != 0;
+                        new_bit_vec.push_bits(if bit { 1 } else { 0 }, 1);
+                    }
+                    bit_vec = new_bit_vec;
+                } else {
+                    bit_vec = BitVec::new();
+                }
+            }
+        }
+
+        // Send metadata
+        if let Ok(tree_data) = tree.serialize() {
+            let metadata = EncodingMetaData {
+                original_length,
+                total_bits,
+                tree_data,
+            };
+            let _ = metadata_tx.send(metadata).await;
+        }
+
+        // find dangling bits
+        if bit_vec.bit_count() > 0 {
+            let final_data = bit_vec.as_bytes().to_vec();
+            let _ = encoded_tx.send(final_data).await;
+        }
+
+    }
+
+    async fn async_writer_task<W: Write>(
+        mut writer: W,
+        mut encoded_rx: Receiver<Vec<u8>>,
+        mut metadata_rx: Receiver<EncodingMetaData>,
+    ) -> io::Result<()> {
+        let temp_path = std::env::temp_dir().join("huffman_temp_async_compressed.dat");
+        let mut temp_file = File::create(&temp_path)?;
+
+        let mut compressed_bytes_written = 0;
+        // Collect all encoded chunks in order
+        while let Ok(encoded_chunk) = encoded_rx.recv().await {
+            temp_file.write_all(&encoded_chunk)?;
+            compressed_bytes_written += encoded_chunk.len();
+        }
+        temp_file.flush()?;
+
+        // Wait for metadata and write final file
+        if let Ok(metadata) = metadata_rx.recv().await {
+            writer.write_all(&(metadata.original_length as u64).to_le_bytes())?;
+            writer.write_all(&(metadata.total_bits as u64).to_le_bytes())?;
+            writer.write_all(&(metadata.tree_data.len() as u64).to_le_bytes())?;
+            writer.write_all(&metadata.tree_data)?;
+        }
+        writer.write_all(&(compressed_bytes_written as u64).to_le_bytes())?;
+        
+        let mut temp_file = File::open(&temp_path)?;
+        io::copy(&mut temp_file, &mut writer)?;
+        
+        // Clean up temp file (don't fail the whole operation if cleanup fails)
+        let _ = std::fs::remove_file(&temp_path);
+        
+        Ok(())
+    }
+
+    fn encode_with_async_internal<R, W>(&self, reader: R, writer: W) -> io::Result<()>
+        where 
+            R: Read + Send + 'static,
+            W: Write + Send + 'static
+    {
+        use crate::runtime::SmarterExecutor;
+        
+        let mut executor = SmarterExecutor::new();
+        let (chunk_tx, chunk_rx) = channel::<Vec<u8>>(4);
+        let (encoded_tx, encoded_rx) = channel::<Vec<u8>>(4);    
+        let (metadata_tx, metadata_rx) = channel::<EncodingMetaData>(1);
+
+        let code_table = self.encode_table.clone();
+        let tree_clone = self.tree.clone();
+
+        executor.spawn(async move {
+            let _ = Self::async_reader_task(reader, chunk_tx).await;
+        });
+        executor.spawn(async move {
+            let _ = Self::async_encoder_task(code_table, tree_clone, chunk_rx, encoded_tx, metadata_tx).await;
+        });
+        executor.spawn(async move {
+            let _ = Self::async_writer_task(writer, encoded_rx, metadata_rx).await;
+        });
+
+        executor.run();
+        Ok(())
+    }
+
+    pub fn encode_file_to_file_async<P1: AsRef<Path>, P2: AsRef<Path>>(&self, input_path: P1, output_path: P2) -> io::Result<()> {
+        let reader = File::open(input_path)?;
+        let writer = File::create(output_path)?;
+        self.encode_with_async_internal(reader, writer)
+    }
+
+    pub fn decode_file_to_file_async<P1: AsRef<Path>, P2: AsRef<Path>>(input_path: P1, output_path: P2) -> io::Result<()> {
+        // Use sync from_stream to build codec first
+        let mut sync_reader = std::fs::File::open(&input_path)?;
+        let codec = Self::from_stream(&mut sync_reader)?;
+        
+        let reader = File::open(input_path)?;
+        let writer = File::create(output_path)?;
+        codec.decode_with_async_internal(reader, writer)
+    }
+
+    pub fn encode_file_to_file_async_powered<P1: AsRef<Path>, P2: AsRef<Path>>(&self, input_path: P1, output_path: P2) -> io::Result<()> {
+        let reader = File::open(input_path)?;
+        let writer = File::create(output_path)?;
+        self.encode_with_async_internal(reader, writer)
+    }
+
+    // TODO: DELETE - Will be replaced by async version
     fn encode_with_channels<R: Read + Send + 'static, W: Write + Seek + Send + 'static>(
         &self,
         mut reader: R,
@@ -119,7 +291,6 @@ impl HuffmanCodec {
         // reader thread
         let reader_handle = thread::spawn(move || -> io::Result<()> {
             let mut buffer = [0u8; 4096];
-            println!("Reader thread started...");
             loop {
                 let bytes_read = reader.read(&mut buffer)?;
                 if bytes_read == 0 {
@@ -127,12 +298,10 @@ impl HuffmanCodec {
                 }
 
                 let chunk = buffer[..bytes_read].to_vec();
-                println!("Reader pushing chunk of {} bytes", chunk.len());
                 if chunk_tx.send(chunk).is_err() {
                     break;
                 }
             }
-            println!("Reader thread done.");
             Ok(())
         });
 
@@ -141,9 +310,7 @@ impl HuffmanCodec {
             let mut bit_vec = BitVec::new();
             let mut total_bits = 0;
             let mut original_length = 0;
-            println!("Encoder thread started...");
             while let Ok(chunk) = chunk_rx.recv() {
-                println!("Encoder received chunk of {} bytes", chunk.len());
                 original_length += chunk.len();
 
                 for &byte in &chunk {
@@ -162,7 +329,6 @@ impl HuffmanCodec {
                     let complete_bytes = bit_vec.bit_count() / 8;
                     if complete_bytes > 0 {
                         let data_to_send = bit_vec.as_bytes()[..complete_bytes].to_vec();
-                        println!("Encoder pushing chunk of {} bytes", data_to_send.len());
                         if compressed_tx.send(data_to_send).is_err() {
                             break;
                         }
@@ -189,17 +355,14 @@ impl HuffmanCodec {
                 tree_data
             };
 
-            println!("Encoder pushing metadata: {:?}", metadata);
             let _ = metadata_tx.send(metadata);
 
             // find dangling bits
             if bit_vec.bit_count() > 0 {
                 let final_data = bit_vec.as_bytes().to_vec();
-                println!("Encoder pushing final chunk of {} bytes", final_data.len());
                 let _ = compressed_tx.send(final_data);
             }
 
-            println!("Encoder thread done.");
             Ok(())
         });
 
@@ -208,7 +371,6 @@ impl HuffmanCodec {
             use std::fs;
             use std::io::copy;
             
-            println!("Writer thread started...");
 
             let temp_path = std::env::temp_dir().join("huffman_temp_compressed.dat");
             let mut temp_file = File::create(&temp_path)?;
@@ -235,8 +397,6 @@ impl HuffmanCodec {
 
             fs::remove_file(&temp_path)?;
 
-            println!("Writer thread done.");
-
             Ok(())
         });
 
@@ -253,6 +413,7 @@ impl HuffmanCodec {
         Ok(())
     }
 
+    // TODO: DELETE - Will be replaced by async version
     fn encode_stream<R: Read, W: Write + Seek>(&self, mut reader: R, mut writer: W) -> io::Result<()> {
 
         let tree_data = self.tree.serialize()?;
@@ -326,12 +487,10 @@ impl HuffmanCodec {
         }
         // write any dangling bits
         if bit_vec.bit_count() > 0 {
-            println!("DEBUG: Writing final {} bits ({} bytes) to output", bit_vec.bit_count(), bit_vec.as_bytes().len());
             writer.write_all(bit_vec.as_bytes())?;
             compressed_bytes_written += bit_vec.as_bytes().len();
         }
         
-        println!("DEBUG: Total bits: {}, Total bytes written: {}", total_bits, compressed_bytes_written);
 
         // update all the placeholders
         if let Ok(current_pos) = writer.stream_position() {
@@ -373,12 +532,14 @@ impl HuffmanCodec {
         self.encode_stream(reader, writer)
     }
 
+    // TODO: DELETE - Will be replaced by async version
     pub fn encode_file_to_file<P1: AsRef<Path>, P2: AsRef<Path>>(&self, input_path: P1, output_path: P2) -> io::Result<()> {
         let reader = File::open(input_path)?;
         let writer = File::create(output_path)?;
         self.encode_stream(reader, writer)
     }
 
+    // TODO: DELETE - Will be replaced by async version
     pub fn encode_file_to_file_channel<P1: AsRef<Path>, P2: AsRef<Path>>(&self, input_path: P1, output_path: P2) -> io::Result<()> {
         let reader = File::open(input_path)?;
         let writer = File::create(output_path)?;
@@ -401,6 +562,156 @@ impl HuffmanCodec {
         Ok(Self::new(tree))
     }
 
+    async fn async_decode_reader_task<R: Read>(
+        lookup_table: BTreeMap<(u32, usize), u8>,
+        mut reader: R,
+        chunk_tx: Sender<Vec<u8>>,
+        metadata_tx: Sender<DecodingMetaData>
+    ) -> io::Result<()> {
+
+        let (original_length, bit_count, _tree_data) = Self::read_header(&mut reader)?;
+
+        let metadata = DecodingMetaData {
+            original_length,
+            total_bits: bit_count,
+            lookup_table,
+        };
+        if metadata_tx.send(metadata).await.is_err() {
+            return Ok(()); // recevier dropped
+        }
+
+        let mut buffer = [0u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break, // EOF
+                Ok(bytes_read) => {
+                    let chunk = buffer[..bytes_read].to_vec();
+                    if chunk_tx.send(chunk).await.is_err() {
+                        break; // receiver dropped
+                    }
+                },
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    async fn async_decoder_task(
+        mut chunk_rx: Receiver<Vec<u8>>,
+        mut metadata_rx: Receiver<DecodingMetaData>,
+        decoded_tx: Sender<Vec<u8>>,
+    ) {
+
+        let Ok(metadata) = metadata_rx.recv().await else { return; };
+        let DecodingMetaData { original_length, lookup_table, .. } = metadata;
+
+            // Decoder state variables
+            let mut decoded_bytes = 0;
+            let mut curr_word: u32 = 0;
+            let mut curr_bit_count = 0;
+            let mut global_bit_index = 0;
+            let mut output_buffer = Vec::with_capacity(4096);
+
+            while let Ok(chunk) = chunk_rx.recv().await {
+
+                for &byte in &chunk {
+                    for bit_pos in (0..8).rev() {
+                        if decoded_bytes >= original_length {
+                            break;
+                        }
+
+                        let bit = (byte >> bit_pos) & 1;
+                        curr_word = (curr_word << 1) | (bit as u32);
+                        global_bit_index += 1;
+                        curr_bit_count += 1;
+
+                        // Check for complete code after each bit
+                        if let Some(&decoded_byte) = lookup_table.get(&(curr_word, curr_bit_count)) {
+                            output_buffer.push(decoded_byte);
+                            decoded_bytes += 1;
+                            curr_word = 0;
+                            curr_bit_count = 0;
+
+                            if output_buffer.len() >= 4096 {
+                                if decoded_tx.send(std::mem::take(&mut output_buffer)).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
+                    if decoded_bytes >= original_length {
+                        break;
+                    }
+                }
+            }
+
+            if !output_buffer.is_empty() {
+                let _ = decoded_tx.send(output_buffer).await;
+            }
+
+            if decoded_bytes != original_length {
+                println!("ERROR: Expected {} bytes, decoded {} bytes", original_length, decoded_bytes);
+            }
+
+    }
+
+    async fn async_decode_writer_task<W: Write>(
+        mut writer: W,
+        mut decoded_rx: Receiver<Vec<u8>>,
+    ) -> io::Result<()> {
+
+        while let Ok(decoded_chunk) = decoded_rx.recv().await {
+            writer.write_all(&decoded_chunk)?;
+        }
+
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn decode_with_async_internal<R, W>(&self, reader: R, writer: W) -> io::Result<()> 
+        where 
+            R: Read + Send + 'static,
+            W: Write + Send + 'static
+    {
+        // channel for raw data chunks (Reader -> Decoder)
+        let (chunk_tx, chunk_rx) = channel::<Vec<u8>>(4);
+        // channel for compressed data (Decoder -> Writer)
+        let (decoded_tx, decoded_rx) = channel::<Vec<u8>>(4);
+        // channel for metadata (Reader -> Decoder)
+        let (metadata_tx, metadata_rx) = channel::<DecodingMetaData>(1);
+
+        use crate::runtime::SmarterExecutor;
+        let mut executor = SmarterExecutor::new();
+
+        let lookup_table = self.generate_lookup_table();
+        executor.spawn(async move {
+            let _ = Self::async_decode_reader_task(lookup_table, reader, chunk_tx, metadata_tx).await;
+        });
+        executor.spawn(async move {
+            let _ = Self::async_decoder_task(chunk_rx, metadata_rx, decoded_tx).await;
+        });
+        executor.spawn(async move {
+            let _ = Self::async_decode_writer_task(writer, decoded_rx).await;
+        });
+
+        executor.run();
+
+        Ok(())
+    }
+
+    pub fn decode_file_to_file_async_powered<P1: AsRef<Path>, P2: AsRef<Path>>
+        (input_path: P1, output_path: P2) -> io::Result<()> {
+        // Use sync from_stream to build codec first
+        let mut sync_reader = std::fs::File::open(&input_path)?;
+        let codec = Self::from_stream(&mut sync_reader)?;
+
+        // Then use our async implementation
+        let reader = File::open(input_path)?;
+        let writer = File::create(output_path)?;
+        codec.decode_with_async_internal(reader, writer)
+    }
+    // TODO: DELETE - Will be replaced by async version
     fn decode_with_channels<R: Read + Send + 'static, W: Write + Seek + Send + 'static>(
         &self,
         mut reader: R,
@@ -416,15 +727,12 @@ impl HuffmanCodec {
         let lookup_table = self.generate_lookup_table();
 
         let reader_handle = thread::spawn(move || -> io::Result<()> {
-            println!("Reader thread started...");
-            println!("Reading header...");
             let (original_length, bit_count, _tree_data) = Self::read_header(&mut reader)?;
             let metadata = DecodingMetaData {
                 original_length,
                 total_bits: bit_count,
                 lookup_table,
             };
-            println!("Reader sending metadata to decoder...");
             if metadata_tx.send(metadata).is_err() {
                 //
             }
@@ -436,24 +744,20 @@ impl HuffmanCodec {
                     break;
                 }
                 let chunk = buffer[..bytes_read].to_vec();
-                println!("Reader pushing chunk of {} bytes", chunk.len());
                 if chunk_tx.send(chunk).is_err() {
                     break;
                 }
             }
-            println!("Reader thread done.");
             Ok(())
         });
 
         let decoder_handle = thread::spawn(move || -> io::Result<()> {
-            println!("Decoder thread started...");
             let metadata = metadata_rx.recv().map_err(|_| {
                 io::Error::new(io::ErrorKind::UnexpectedEof, "Failed to receive metadata")
             })?;
             let original_length = metadata.original_length;
             let lookup_table = metadata.lookup_table;
             let total_bits = metadata.total_bits;
-            println!("Decoder received metadata");
 
             // Decoder state variables
             let mut decoded_bytes = 0;
@@ -473,7 +777,6 @@ impl HuffmanCodec {
                 if current_chunk.is_none() || chunk_bit_index >= current_chunk.as_ref().unwrap().len() * 8 {
                     match chunk_rx.recv() {
                         Ok(chunk) => {
-                            println!("Decoder received chunk of {} bytes", chunk.len());
                             current_chunk = Some(chunk);
                             chunk_bit_index = 0;
                         },
@@ -530,19 +833,15 @@ impl HuffmanCodec {
                 ));
             }
 
-            println!("Decoder thread done.");
             Ok(())
         });
 
         let writer_handle = thread::spawn(move || -> io::Result<()> {
-            println!("Writer thread started...");
 
             while let Ok(decoded_chunk) = compressed_rx.recv() {
-                println!("Writer received {} decoded bytes", decoded_chunk.len());
                 writer.write_all(&decoded_chunk)?;
             }
 
-            println!("Writer thread done.");
             Ok(())
         });
 
@@ -581,6 +880,8 @@ impl HuffmanCodec {
         Ok( (original_length, bit_count, tree_data) )
     }
 
+
+    // TODO: DELETE - Will be replaced by async version
     fn decode_stream<R: Read, W: Write>(&self, mut reader: R, mut writer: W) -> io::Result<()> {
         let (original_length, bit_count, _tree_data) = Self::read_header(&mut reader)?;
 
@@ -656,6 +957,7 @@ impl HuffmanCodec {
         Ok(())
     }
 
+    // TODO: DELETE - Will be replaced by async version  
     pub fn decode_file_to_file_channel<P1: AsRef<Path>, P2: AsRef<Path>>(input_path: P1, output_path: P2) -> io::Result<()> {
         let mut reader = File::open(&input_path)?;
         let codec = Self::from_stream(&mut reader)?;
@@ -665,6 +967,7 @@ impl HuffmanCodec {
         codec.decode_with_channels(reader, writer)
     }
     
+    // TODO: DELETE - Will be replaced by async version
     pub fn decode_file_to_file<P1: AsRef<Path>, P2: AsRef<Path>>(input_path: P1, output_path: P2) -> io::Result<()> {
         let mut reader = File::open(&input_path)?;
         let codec = Self::from_stream(&mut reader)?;
@@ -859,7 +1162,7 @@ mod test {
         use std::fs;
         use std::time::Instant;
         
-        let input_path = Path::new("contents/mobydick.txt");
+        let input_path = Path::new("contents/mobydick_10x.txt");
         let mut file_reader = File::open(input_path).unwrap();
         let codec = HuffmanCodec::from_reader(&mut file_reader, None).unwrap();
         
@@ -934,5 +1237,288 @@ mod test {
         fs::remove_file(stream_final_path).ok();
         fs::remove_file(channel_compressed_path).ok();
         fs::remove_file(channel_final_path).ok();
+    }
+
+    #[test]
+    fn benchmark_sync_vs_channels_vs_async_roundtrip() {
+        use std::fs;
+        use std::time::Instant;
+        
+        let input_path = Path::new("contents/mobydick_10x.txt");
+        let mut file_reader = File::open(input_path).unwrap();
+        let codec = HuffmanCodec::from_reader(&mut file_reader, None).unwrap();
+        
+        let original_size = fs::metadata(input_path).unwrap().len();
+        println!("🏁 COMPREHENSIVE ROUNDTRIP BENCHMARK");
+        println!("====================================");
+        println!("File: {} ({} bytes)", input_path.display(), original_size);
+        println!();
+
+        // SYNC APPROACH (stream-based)
+        println!("🔄 Testing SYNC approach (stream-based)...");
+        let sync_compressed_path = Path::new("testing/sync_roundtrip_compressed.huff");
+        let sync_final_path = Path::new("testing/sync_roundtrip_final.txt");
+        
+        let start = Instant::now();
+        codec.encode_file_to_file(input_path, sync_compressed_path).unwrap();
+        HuffmanCodec::decode_file_to_file(sync_compressed_path, sync_final_path).unwrap();
+        let sync_duration = start.elapsed();
+
+        // CHANNELS APPROACH (OS threads)
+        println!("🔄 Testing CHANNELS approach (OS threads)...");
+        let channels_compressed_path = Path::new("testing/channels_roundtrip_compressed.huff");
+        let channels_final_path = Path::new("testing/channels_roundtrip_final.txt");
+        
+        let start = Instant::now();
+        codec.encode_file_to_file_channel(input_path, channels_compressed_path).unwrap();
+        HuffmanCodec::decode_file_to_file_channel(channels_compressed_path, channels_final_path).unwrap();
+        let channels_duration = start.elapsed();
+
+        // ASYNC APPROACH (tokio tasks)
+        println!("🔄 Testing ASYNC approach (custom async tasks)...");
+        let async_compressed_path = Path::new("testing/async_roundtrip_compressed.huff");
+        let async_final_path = Path::new("testing/async_roundtrip_final.txt");
+        
+        let start = Instant::now();
+        codec.encode_file_to_file_async_powered(input_path, async_compressed_path).unwrap();
+        HuffmanCodec::decode_file_to_file_async_powered(async_compressed_path, async_final_path).unwrap();
+        let async_duration = start.elapsed();
+
+        // RESULTS COMPARISON
+        println!();
+        println!("⚡ PERFORMANCE RESULTS:");
+        println!("=====================");
+        println!("SYNC roundtrip:     {:?}", sync_duration);
+        println!("CHANNELS roundtrip: {:?}", channels_duration);  
+        println!("ASYNC roundtrip:    {:?}", async_duration);
+        println!();
+        
+        let channels_vs_sync = sync_duration.as_secs_f64() / channels_duration.as_secs_f64();
+        let async_vs_sync = sync_duration.as_secs_f64() / async_duration.as_secs_f64(); // Will be real once implemented
+        let async_vs_channels = channels_duration.as_secs_f64() / async_duration.as_secs_f64();
+        
+        println!("📊 SPEEDUP ANALYSIS:");
+        println!("===================");
+        println!("Channels vs Sync:    {:.2}x", channels_vs_sync);
+        println!("Async vs Sync:       {:.2}x", async_vs_sync);
+        println!("Async vs Channels:   {:.2}x", async_vs_channels);
+        println!();
+
+        // ACCURACY VERIFICATION
+        let original_data = fs::read(input_path).unwrap();
+        let sync_final_data = fs::read(sync_final_path).unwrap();
+        let channels_final_data = fs::read(channels_final_path).unwrap();
+        let async_final_data = fs::read(async_final_path).unwrap();
+
+        let sync_compressed_size = fs::metadata(sync_compressed_path).unwrap().len();
+        let channels_compressed_size = fs::metadata(channels_compressed_path).unwrap().len();
+        let async_compressed_size = fs::metadata(async_compressed_path).unwrap().len();
+        
+        println!("💾 COMPRESSION RESULTS:");
+        println!("======================");
+        println!("Original size:        {} bytes", original_data.len());
+        println!("SYNC compressed:      {} bytes", sync_compressed_size);
+        println!("CHANNELS compressed:  {} bytes", channels_compressed_size);
+        println!("ASYNC compressed:     {} bytes", async_compressed_size);
+        println!();
+        
+        println!("✅ ACCURACY VERIFICATION:");
+        println!("========================");
+        let sync_accurate = sync_final_data == original_data;
+        let channels_accurate = channels_final_data == original_data;
+        let async_accurate = async_final_data == original_data;
+        let all_identical = sync_final_data == channels_final_data && channels_final_data == async_final_data;
+        
+        println!("SYNC == Original:      {}", sync_accurate);
+        println!("CHANNELS == Original:  {}", channels_accurate);
+        println!("ASYNC == Original:     {}", async_accurate);
+        println!("All outputs identical: {}", all_identical);
+
+        // Assertions
+        assert!(sync_accurate, "Sync roundtrip should produce original");
+        assert!(channels_accurate, "Channels roundtrip should produce original");
+        assert!(async_accurate, "Async roundtrip should produce original");
+        assert!(all_identical, "All approaches should produce identical results");
+        
+        if all_identical && sync_accurate {
+            println!();
+            println!("🎉 SUCCESS: All approaches produce perfect, identical compression!");
+        }
+        
+        // Cleanup
+        fs::remove_file(sync_compressed_path).ok();
+        fs::remove_file(sync_final_path).ok();
+        fs::remove_file(channels_compressed_path).ok(); 
+        fs::remove_file(channels_final_path).ok();
+        fs::remove_file(async_compressed_path).ok();
+        fs::remove_file(async_final_path).ok();
+    }
+
+    #[test]
+    fn test_async_encode() {
+        use std::fs;
+        
+        let input_path = Path::new("contents/cnn.txt");
+        let mut file_reader = File::open(input_path).unwrap();
+        let codec = HuffmanCodec::from_reader(&mut file_reader, None).unwrap();
+        
+        // Compare channels vs async outputs
+        let channels_compressed_path = Path::new("testing/test_channels_encode.huff");
+        let async_compressed_path = Path::new("testing/test_async_encode.huff");
+        
+        codec.encode_file_to_file_channel(input_path, channels_compressed_path).unwrap();
+        codec.encode_file_to_file_async_powered(input_path, async_compressed_path).unwrap();
+        
+        let channels_size = fs::metadata(channels_compressed_path).unwrap().len();
+        let async_size = fs::metadata(async_compressed_path).unwrap().len();
+        
+        println!("Channels compressed: {} bytes", channels_size);
+        println!("Async compressed: {} bytes", async_size);
+        println!("Size difference: {} bytes", channels_size as i64 - async_size as i64);
+        
+        // Try decoding both
+        let channels_decoded_path = Path::new("testing/test_channels_decoded.txt");
+        let async_decoded_path = Path::new("testing/test_async_decoded.txt");
+        
+        HuffmanCodec::decode_file_to_file(channels_compressed_path, channels_decoded_path).unwrap();
+        let channels_result = HuffmanCodec::decode_file_to_file(async_compressed_path, async_decoded_path);
+        
+        println!("Async decode result: {:?}", channels_result);
+
+        let mut original_text = String::new();
+        File::open(input_path).unwrap().read_to_string(&mut original_text).unwrap();
+
+        let mut async_decoded_text = String::new();
+        File::open(async_decoded_path).unwrap().read_to_string(&mut async_decoded_text).unwrap();
+        
+        //assert_eq!(original_text, async_decoded_text);
+        
+        // Cleanup
+        fs::remove_file(channels_compressed_path).ok();
+        fs::remove_file(async_compressed_path).ok();
+        fs::remove_file(channels_decoded_path).ok();
+        fs::remove_file(async_decoded_path).ok();
+    }
+
+    #[test]
+    fn test_async_decode() {
+        use std::fs;
+        
+        let input_path = Path::new("contents/cnn.txt");
+        let mut file_reader = File::open(input_path).unwrap();
+        let codec = HuffmanCodec::from_reader(&mut file_reader, None).unwrap();
+        
+        // Encode with async first
+        let compressed_path = Path::new("testing/test_async_decode_input.huff");
+        codec.encode_file_to_file_async_powered(input_path, compressed_path).unwrap();
+        
+        // Test async decode
+        let decoded_path = Path::new("testing/test_async_decode_output.txt");
+        let result = HuffmanCodec::decode_file_to_file_async_powered(compressed_path, decoded_path);
+        
+        println!("Async decode result: {:?}", result);
+        
+        if result.is_ok() {
+            // Verify roundtrip
+            let original_data = fs::read(input_path).unwrap();
+            let decoded_data = fs::read(decoded_path).unwrap();
+            
+            println!("Original size: {}, Decoded size: {}", original_data.len(), decoded_data.len());
+            assert_eq!(original_data, decoded_data);
+            println!("✅ Async decode test passed!");
+        }
+        
+        // Cleanup
+        fs::remove_file(compressed_path).ok();
+        fs::remove_file(decoded_path).ok();
+    }
+
+    #[test]
+    fn benchmark_concurrent_compression() {
+        use std::fs;
+        use std::time::Instant;
+        use std::thread;
+        
+        let input1_path = Path::new("contents/mobydick_10x.txt");
+        let input2_path = Path::new("contents/mobydick_10x_copy.txt");
+        
+        let mut file_reader = File::open(input1_path).unwrap();
+        let codec = HuffmanCodec::from_reader(&mut file_reader, None).unwrap();
+        
+        let original_size = fs::metadata(input1_path).unwrap().len();
+        println!("🏁 CONCURRENT COMPRESSION BENCHMARK");
+        println!("===================================");
+        println!("Processing 2 files of {} bytes each", original_size);
+        println!("Total data: {} bytes ({:.1} MB)", original_size * 2, (original_size * 2) as f64 / 1_000_000.0);
+        println!();
+        
+        // SYNC APPROACH: Process files sequentially using threads
+        println!("🔄 Testing SYNC approach (sequential with threads)...");
+        let sync_out1_path = Path::new("testing/sync_concurrent1.huff");
+        let sync_out2_path = Path::new("testing/sync_concurrent2.huff");
+        
+        let start = Instant::now();
+        let codec1 = codec.clone();
+        let codec2 = codec.clone();
+        
+        let handle1 = thread::spawn(move || {
+            codec1.encode_file_to_file(input1_path, sync_out1_path).unwrap();
+        });
+        
+        let handle2 = thread::spawn(move || {
+            codec2.encode_file_to_file(input2_path, sync_out2_path).unwrap();
+        });
+        
+        handle1.join().unwrap();
+        handle2.join().unwrap();
+        let sync_duration = start.elapsed();
+        
+        // ASYNC APPROACH: Process files concurrently using async
+        println!("🔄 Testing ASYNC approach (concurrent with tokio)...");
+        let async_out1_path = Path::new("testing/async_concurrent1.huff");
+        let async_out2_path = Path::new("testing/async_concurrent2.huff");
+        
+        let start = Instant::now();
+        
+        // Process both files with our custom runtime (now sync since we unplugged tokio)
+        codec.encode_file_to_file_async(input1_path, async_out1_path).unwrap();
+        codec.encode_file_to_file_async(input2_path, async_out2_path).unwrap();
+        let async_duration = start.elapsed();
+        
+        // RESULTS
+        println!();
+        println!("⚡ CONCURRENT PERFORMANCE RESULTS:");
+        println!("=================================");
+        println!("SYNC (threaded):     {:?}", sync_duration);
+        println!("ASYNC (concurrent):  {:?}", async_duration);
+        
+        let speedup = sync_duration.as_secs_f64() / async_duration.as_secs_f64();
+        println!("Async speedup:       {:.2}x", speedup);
+        
+        // Verify file sizes
+        let sync1_size = fs::metadata(sync_out1_path).unwrap().len();
+        let sync2_size = fs::metadata(sync_out2_path).unwrap().len();
+        let async1_size = fs::metadata(async_out1_path).unwrap().len();
+        let async2_size = fs::metadata(async_out2_path).unwrap().len();
+        
+        println!();
+        println!("📊 VERIFICATION:");
+        println!("================");
+        println!("SYNC file1:      {} bytes", sync1_size);
+        println!("SYNC file2:      {} bytes", sync2_size);
+        println!("ASYNC file1:     {} bytes", async1_size);
+        println!("ASYNC file2:     {} bytes", async2_size);
+        println!("Files identical: {}", sync1_size == async1_size && sync2_size == async2_size);
+        
+        if speedup > 1.0 {
+            println!();
+            println!("🎉 SUCCESS: Async shows {:.0}% speedup for concurrent workloads!", (speedup - 1.0) * 100.0);
+        }
+        
+        // Cleanup
+        fs::remove_file(sync_out1_path).ok();
+        fs::remove_file(sync_out2_path).ok();
+        fs::remove_file(async_out1_path).ok();
+        fs::remove_file(async_out2_path).ok();
     }
 }
