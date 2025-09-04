@@ -1,4 +1,4 @@
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct BitVec {
     bits: Vec<u8>,
     bit_count: usize,
@@ -84,5 +84,11 @@ impl BitVec {
         }
         
         result
+    }
+}
+
+impl From<(usize, Vec<u8>)> for BitVec {
+    fn from((bit_count, bits): (usize, Vec<u8>)) -> Self {
+        BitVec { bits, bit_count }
     }
 }

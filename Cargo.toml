@@ -2,6 +2,15 @@
 name = "rust_huffman"
 version = "0.1.0"
 edition = "2024"
+description = "A Huffman compression library"
+repository = "https://github.com/smythg4/rust_huffman"
+keywords = ["compression", "huffman", "encoding", "async"]
+categories = ["compression", "algorithms"]
+readme = "README.md"
+
+[lib]
+name = "rust_huffman"
+path = "src/lib.rs"
 
 [dependencies]
 

@@ -64,6 +64,17 @@ impl HuffmanTree {
         table
     }
 
+    pub fn generate_decode_table(&self) -> BTreeMap<(u32, usize), u8> {
+        let encode_table = self.generate_table();
+        let mut decode_table = BTreeMap::new();
+        
+        for (byte, (code, length)) in encode_table {
+            decode_table.insert((code, length), byte);
+        }
+        
+        decode_table
+    }
+
     fn from_frequencies(frequencies: HashMap<u8, usize>) -> Result<Self, HuffmanError> {
         let mut nodes: Vec<HuffNode> = frequencies.into_iter()
             .map(|(byte, count)| HuffNode::new(byte, count))
