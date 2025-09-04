@@ -1,7 +1,7 @@
-use std::io::{self, Cursor, Write, Read};
-use std::collections::{HashMap, BTreeMap};
-use crate::min_heap::{MinHeap,HeapErr};
+use crate::min_heap::{HeapErr, MinHeap};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
+use std::io::{self, Cursor, Read, Write};
 use std::path::Path;
 
 #[derive(Debug)]
@@ -23,13 +23,11 @@ pub struct HuffmanTree {
 }
 
 impl HuffmanTree {
-
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, HuffmanError> {
         use std::collections::HashMap;
 
-        let counts: HashMap<u8, usize> = bytes.iter()
-            .copied()
-            .fold(HashMap::new(), |mut acc, byte| {
+        let counts: HashMap<u8, usize> =
+            bytes.iter().copied().fold(HashMap::new(), |mut acc, byte| {
                 *acc.entry(byte).or_insert(0) += 1;
                 acc
             });
@@ -38,9 +36,8 @@ impl HuffmanTree {
     }
 
     fn build_from_heap(mut heap: MinHeap<HuffNode>) -> Result<Self, HeapErr> {
-        let n = heap.heap_size()-1;
+        let n = heap.heap_size() - 1;
         for _ in 0..n {
-
             let x = heap.extract_min()?;
             let y = heap.extract_min()?;
 
@@ -48,15 +45,14 @@ impl HuffmanTree {
 
             heap.insert(z)?;
         }
-        let root =  heap.elements.into_iter()
+        let root = heap
+            .elements
+            .into_iter()
             .next()
             .ok_or(HeapErr::HeapUnderflow)?;
 
-        Ok(HuffmanTree {
-            root,
-        })
+        Ok(HuffmanTree { root })
     }
-
 
     pub fn generate_table(&self) -> BTreeMap<u8, (u32, usize)> {
         let mut table = BTreeMap::new();
@@ -67,16 +63,17 @@ impl HuffmanTree {
     pub fn generate_decode_table(&self) -> BTreeMap<(u32, usize), u8> {
         let encode_table = self.generate_table();
         let mut decode_table = BTreeMap::new();
-        
+
         for (byte, (code, length)) in encode_table {
             decode_table.insert((code, length), byte);
         }
-        
+
         decode_table
     }
 
     fn from_frequencies(frequencies: HashMap<u8, usize>) -> Result<Self, HuffmanError> {
-        let mut nodes: Vec<HuffNode> = frequencies.into_iter()
+        let mut nodes: Vec<HuffNode> = frequencies
+            .into_iter()
             .map(|(byte, count)| HuffNode::new(byte, count))
             .collect();
 
@@ -97,7 +94,7 @@ impl HuffmanTree {
         match node {
             HuffNode::Leaf { byte, weight } => {
                 frequencies.insert(*byte, *weight);
-            },
+            }
             HuffNode::Internal { left, right, .. } => {
                 Self::extract_node_frequencies(left, frequencies);
                 Self::extract_node_frequencies(right, frequencies);
@@ -158,10 +155,16 @@ impl HuffmanTree {
         let indent = "  ".repeat(depth);
         match node {
             HuffNode::Leaf { byte, weight } => {
-                println!("{}{}-> Leaf: '{}' ({}) [weight: {}]", 
-                        indent, label, *byte as char, byte, weight);
-            },
-            HuffNode::Internal { weight, left, right } => {
+                println!(
+                    "{}{}-> Leaf: '{}' ({}) [weight: {}]",
+                    indent, label, *byte as char, byte, weight
+                );
+            }
+            HuffNode::Internal {
+                weight,
+                left,
+                right,
+            } => {
                 println!("{}{}-> Internal [weight: {}]", indent, label, weight);
                 Self::print_node(left, depth + 1, "L");
                 Self::print_node(right, depth + 1, "R");
@@ -172,7 +175,9 @@ impl HuffmanTree {
 
 impl std::default::Default for HuffmanTree {
     fn default() -> Self {
-        HuffmanTree { root: HuffNode::new(0,0) }
+        HuffmanTree {
+            root: HuffNode::new(0, 0),
+        }
     }
 }
 
@@ -195,23 +200,20 @@ impl From<&Path> for HuffmanTree {
 
 #[derive(Debug, Clone)]
 pub enum HuffNode {
-    Leaf { 
-        weight: usize, 
-        byte: u8 
+    Leaf {
+        weight: usize,
+        byte: u8,
     },
-    Internal { 
-        weight: usize, 
-        left: Box<HuffNode>, 
-        right: Box<HuffNode> 
-    }
+    Internal {
+        weight: usize,
+        left: Box<HuffNode>,
+        right: Box<HuffNode>,
+    },
 }
 
 impl HuffNode {
     pub fn new(b: u8, f: usize) -> Self {
-        HuffNode::Leaf {
-            weight: f,
-            byte: b,
-        }
+        HuffNode::Leaf { weight: f, byte: b }
     }
 
     pub fn weight(&self) -> usize {
@@ -231,11 +233,16 @@ impl HuffNode {
         }
     }
 
-    pub fn generate_table(&self, code_table: &mut BTreeMap<u8, (u32, usize)>, code: u32, depth: usize) {
+    pub fn generate_table(
+        &self,
+        code_table: &mut BTreeMap<u8, (u32, usize)>,
+        code: u32,
+        depth: usize,
+    ) {
         match self {
             HuffNode::Leaf { byte, .. } => {
                 code_table.insert(*byte, (code, depth));
-            },
+            }
             HuffNode::Internal { left, right, .. } => {
                 // Left = 0, Right = 1, building codes from MSB to LSB
                 left.generate_table(code_table, code << 1, depth + 1);
@@ -243,19 +250,24 @@ impl HuffNode {
             }
         }
     }
-
-
 }
 
 impl PartialEq for HuffNode {
-    fn eq(&self, other: &Self) -> bool { 
+    fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (HuffNode::Leaf { byte: a, weight: w1 }, HuffNode::Leaf { byte: b, weight: w2 }) => {
-                w1 == w2 && a == b
-            },
+            (
+                HuffNode::Leaf {
+                    byte: a,
+                    weight: w1,
+                },
+                HuffNode::Leaf {
+                    byte: b,
+                    weight: w2,
+                },
+            ) => w1 == w2 && a == b,
             (HuffNode::Internal { weight: w1, .. }, HuffNode::Internal { weight: w2, .. }) => {
                 w1 == w2
-            },
+            }
             _ => false,
         }
     }
@@ -265,7 +277,7 @@ impl Eq for HuffNode {}
 
 impl PartialOrd for HuffNode {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))        
+        Some(self.cmp(other))
     }
 }
 
@@ -277,23 +289,19 @@ impl Ord for HuffNode {
                 // If weights are equal, use tie-breaking rules for deterministic ordering
                 match (self, other) {
                     // Leaf nodes: compare by byte value
-                    (HuffNode::Leaf { byte: a, .. }, HuffNode::Leaf { byte: b, .. }) => {
-                        a.cmp(b)
-                    },
+                    (HuffNode::Leaf { byte: a, .. }, HuffNode::Leaf { byte: b, .. }) => a.cmp(b),
                     // Leaf vs Internal: Leaf comes first (lower priority)
-                    (HuffNode::Leaf { .. }, HuffNode::Internal { .. }) => {
-                        std::cmp::Ordering::Less
-                    },
+                    (HuffNode::Leaf { .. }, HuffNode::Internal { .. }) => std::cmp::Ordering::Less,
                     (HuffNode::Internal { .. }, HuffNode::Leaf { .. }) => {
                         std::cmp::Ordering::Greater
-                    },
+                    }
                     // Internal vs Internal: compare by some deterministic property
                     // For now, just consider them equal if weights are equal
                     (HuffNode::Internal { .. }, HuffNode::Internal { .. }) => {
                         std::cmp::Ordering::Equal
-                    },
+                    }
                 }
-            },
+            }
             other => other,
         }
     }

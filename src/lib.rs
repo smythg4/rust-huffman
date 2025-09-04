@@ -8,6 +8,7 @@
 //! use rust_huffman::huffman_codec::HuffmanCodec;
 //! use std::fs::File;
 //!
+//! # std::fs::write("input.txt", "Hello, world!")?;
 //! // Compress a file
 //! let input = File::open("input.txt")?;
 //! let output = File::create("compressed.huff")?;
@@ -17,6 +18,9 @@
 //! let compressed = File::open("compressed.huff")?;
 //! let decompressed = File::create("output.txt")?;
 //! HuffmanCodec::decode_from_file(compressed, decompressed)?;
+//! # std::fs::remove_file("input.txt")?;
+//! # std::fs::remove_file("compressed.huff")?;
+//! # std::fs::remove_file("output.txt")?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
@@ -26,7 +30,6 @@ pub mod metadata;
 
 // Internal modules - not part of public API
 mod bit_vec;
-mod compressed_data;
 mod min_heap;
 
 // Re-export main types for convenience

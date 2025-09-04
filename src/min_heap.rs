@@ -4,17 +4,12 @@ pub struct MinHeap<T> {
 }
 
 impl<T> MinHeap<T> {
-
     pub fn new() -> Self {
         MinHeap { elements: vec![] }
     }
 
     pub fn heap_size(&self) -> usize {
         self.elements.len()
-    }
-
-    pub fn heap_capacity(&self) -> usize {
-        self.elements.capacity()
     }
 
     pub fn parent(&self, i: usize) -> usize {
@@ -38,13 +33,10 @@ pub enum HeapErr {
 }
 
 impl<T: PartialEq + PartialOrd + std::fmt::Debug + Clone> MinHeap<T> {
-
     pub fn build(source: Vec<T>) -> Result<Self, HeapErr> {
-        let mut heap = MinHeap{
-            elements: source,
-        };
+        let mut heap = MinHeap { elements: source };
         let n = heap.heap_size();
-        for i in (0..=n/2).rev() {
+        for i in (0..=n / 2).rev() {
             heap.min_heapify(i)?;
         }
         Ok(heap)
@@ -88,18 +80,11 @@ impl<T: PartialEq + PartialOrd + std::fmt::Debug + Clone> MinHeap<T> {
         // this is far less than optimal. See page 175 of Cormen
         self.elements.push(value);
         let n = self.heap_size();
-        for i in (0..=n/2).rev() {
+        for i in (0..=n / 2).rev() {
             self.min_heapify(i)?;
         }
         assert!(self.valid_min_heap());
         Ok(())
-    }
-
-    pub fn minimum(&self) -> Result<T, HeapErr> {
-        if self.heap_size() < 1 {
-            return Err(HeapErr::HeapUnderflow);
-        }
-        Ok(self.elements[0].clone())
     }
 
     pub fn extract_min(&mut self) -> Result<T, HeapErr> {
@@ -112,10 +97,6 @@ impl<T: PartialEq + PartialOrd + std::fmt::Debug + Clone> MinHeap<T> {
         let result = self.elements.remove(n);
         self.min_heapify(0)?;
         Ok(result)
-    }
-
-    pub fn decrease_key(&mut self) -> Result<(), HeapErr> {
-        todo!()
     }
 }
 

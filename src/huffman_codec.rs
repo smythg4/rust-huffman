@@ -1,12 +1,11 @@
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::fs::File;
 
-use crate::hufftree::HuffmanTree;
 use crate::bit_vec::BitVec;
+use crate::hufftree::HuffmanTree;
 use crate::metadata;
-
 
 pub struct SamplingConfig {
     pub sample_size: usize,
@@ -17,7 +16,7 @@ impl Default for SamplingConfig {
     fn default() -> Self {
         SamplingConfig {
             sample_size: 1024,
-            num_samples: 15
+            num_samples: 15,
         }
     }
 }
@@ -31,11 +30,8 @@ pub struct HuffmanCodec {
 impl HuffmanCodec {
     pub fn new(tree: HuffmanTree) -> Self {
         let encode_table = tree.generate_table();
-        
-        HuffmanCodec {
-            tree,
-            encode_table,
-        }
+
+        HuffmanCodec { tree, encode_table }
     }
 
     pub fn from_file_full(path: &Path) -> io::Result<Self> {
@@ -43,22 +39,23 @@ impl HuffmanCodec {
         let mut data = Vec::new();
         file.read_to_end(&mut data)?;
 
-        let tree = HuffmanTree::from_bytes(&data).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "Failed to build tree")
-        })?;
+        let tree = HuffmanTree::from_bytes(&data)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Failed to build tree"))?;
 
         Ok(Self::new(tree))
     }
 
-    pub fn from_reader_sampling<R: Read + Seek>(reader: &mut R, config: Option<SamplingConfig>) -> io::Result<Self> {
+    pub fn from_reader_sampling<R: Read + Seek>(
+        reader: &mut R,
+        config: Option<SamplingConfig>,
+    ) -> io::Result<Self> {
         // get reader size
         let current_pos = reader.stream_position()?;
         let total_size = reader.seek(SeekFrom::End(0))?;
         reader.seek(SeekFrom::Start(current_pos))?;
 
         if total_size == 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData,
-                "Empty input"));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Empty input"));
         }
 
         let config = config.unwrap_or_default();
@@ -81,17 +78,17 @@ impl HuffmanCodec {
         }
 
         let tree = HuffmanTree::from_bytes(&sample_data).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "Failed to build tree from samples")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Failed to build tree from samples",
+            )
         })?;
 
         Ok(Self::new(tree))
     }
 
     // Static streaming operations - build tree and process in one step
-    pub fn encode_from_file<R: Read, W: Write>(
-        mut reader: R,
-        mut writer: W,
-    ) -> io::Result<()> {
+    pub fn encode_from_file<R: Read, W: Write>(mut reader: R, mut writer: W) -> io::Result<()> {
         // Read everything first to calculate metadata
         let mut all_data = Vec::new();
         reader.read_to_end(&mut all_data)?;
@@ -100,9 +97,8 @@ impl HuffmanCodec {
         let mut total_bits = 0;
 
         // Build tree from all data
-        let tree = HuffmanTree::from_bytes(&all_data).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "Failed to build tree")
-        })?;
+        let tree = HuffmanTree::from_bytes(&all_data)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Failed to build tree"))?;
         let encode_table = tree.generate_table();
 
         // Encode all data
@@ -134,7 +130,7 @@ impl HuffmanCodec {
     ) -> io::Result<()> {
         let codec = Self::from_reader_sampling(&mut reader, config)?;
         reader.seek(SeekFrom::Start(0))?;
-        
+
         // Read everything to encode
         // this needs to be changed. we can track byte position, write a placeholder in the header
         // then come back through and fill it in.
@@ -166,10 +162,7 @@ impl HuffmanCodec {
         Ok(())
     }
 
-    pub fn decode_from_file<R: Read, W: Write>(
-        mut reader: R,
-        mut writer: W,
-    ) -> io::Result<()> {
+    pub fn decode_from_file<R: Read, W: Write>(mut reader: R, mut writer: W) -> io::Result<()> {
         let (original_length, _total_bits, tree_data) = metadata::read_header(&mut reader)?;
 
         let mut compressed_data = Vec::new();
@@ -204,7 +197,11 @@ impl HuffmanCodec {
         Ok(())
     }
 
-    pub fn decode_from_file_path<P: AsRef<Path>, W: Write>(&self, input_path: P, mut writer: W) -> io::Result<()> {
+    pub fn decode_from_file_path<P: AsRef<Path>, W: Write>(
+        &self,
+        input_path: P,
+        mut writer: W,
+    ) -> io::Result<()> {
         let mut input_file = File::open(input_path)?;
         let (original_length, _total_bits, tree_data) = metadata::read_header(&mut input_file)?;
 
@@ -245,7 +242,6 @@ impl HuffmanCodec {
         writer.write_all(&result)?;
         Ok(())
     }
-
 
     pub fn decode(&self, encoded_data: &[u8], original_length: usize) -> io::Result<Vec<u8>> {
         let lookup_table = self.tree.generate_decode_table();

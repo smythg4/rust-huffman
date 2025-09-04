@@ -55,7 +55,7 @@ pub fn read_chunked_header<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
 }
 
 pub fn write_chunked_trailer<W: Write>(writer: &mut W, original_length: usize) -> io::Result<()> {
-    let ol_bytes = (original_length as u64).to_le_bytes(); 
+    let ol_bytes = (original_length as u64).to_le_bytes();
     writer.write_all(&ol_bytes)?;
     Ok(())
 }
