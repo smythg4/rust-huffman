@@ -1,3 +1,24 @@
-/target
+# Rust
+/target/
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files and temporary data
+*.huff
+*_compressed*
+*_decompressed*
+*_decoded*
+/testing/
+/contents/
+
+# Unused code
 _unused_code.rs
-/testing
