@@ -182,6 +182,7 @@ impl std::default::Default for HuffmanTree {
 }
 
 impl From<&str> for HuffmanTree {
+    // remove these unwraps and do it right
     fn from(text: &str) -> Self {
         let tbytes = text.as_bytes();
         HuffmanTree::from_bytes(tbytes).unwrap()
@@ -189,6 +190,7 @@ impl From<&str> for HuffmanTree {
 }
 
 impl From<&Path> for HuffmanTree {
+     // remove these unwraps and do it right
     fn from(path: &Path) -> Self {
         use std::io::Read;
         let mut f = File::open(path).unwrap();
