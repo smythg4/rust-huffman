@@ -77,7 +77,6 @@ impl<T: PartialEq + PartialOrd + std::fmt::Debug + Clone> MinHeap<T> {
     }
 
     pub fn insert(&mut self, value: T) -> Result<(), HeapErr> {
-        // this is far less than optimal. See page 175 of Cormen
         self.elements.push(value);
         let mut i = self.heap_size() - 1;
 
